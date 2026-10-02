@@ -406,7 +406,7 @@ namespace ChatApp
                 d /= 1024;
                 i++;
             }
-            return $"{d:0.1} {suffixes[i]}";
+            return $"{d:0.0} {suffixes[i]}";
         }
 
         private void SaveChatHistory()
@@ -672,35 +672,31 @@ namespace ChatApp
             if (ofd.ShowDialog(this) != DialogResult.OK) return;
 
             var fileInfo = new FileInfo(ofd.FileName);
-            const long maxFileSize = 50 * 1024 * 1024; // 50 MB limit
+            const long maxFileSize = 1024L * 1024 * 1024; // 1 GB limit
             if (fileInfo.Length > maxFileSize)
             {
-                AppendErrorLog($"File size ({FormatFileSize(fileInfo.Length)}) exceeds the 50 MB limit.");
+                AppendErrorLog($"File size ({FormatFileSize(fileInfo.Length)}) exceeds the 1 GB limit.");
+                return;
+            }
+
+            if (fileInfo.Length == 0)
+            {
+                AppendErrorLog("Cannot send an empty file (0 bytes).");
                 return;
             }
 
             btnSend.Enabled = false;
             btnSendFile.Enabled = false;
             txtMsg.Enabled = false;
-            SetStatus($"Reading {fileInfo.Name}...");
+            SetStatus($"Preparing {fileInfo.Name} ({FormatFileSize(fileInfo.Length)})...");
 
             try
             {
-                byte[] fileBytes = await File.ReadAllBytesAsync(ofd.FileName);
-
-                var packet = new ChatPacket
-                {
-                    Type = "file",
-                    Sender = txtNickname.Text.Trim(),
-                    FileName = fileInfo.Name,
-                    FileSize = fileBytes.Length,
-                    FileData = Convert.ToBase64String(fileBytes)
-                };
-
-                string jsonPayload = JsonSerializer.Serialize(packet);
+                const int chunkSize = 1024 * 1024; // 1 MB streaming chunks for low memory overhead
+                int totalChunks = (int)Math.Ceiling((double)fileInfo.Length / chunkSize);
 
                 using var client = new TcpClient();
-                using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(60));
+                using var cts = new CancellationTokenSource(TimeSpan.FromMinutes(30));
 
                 SetStatus($"Connecting to {dest}:{port}...");
                 await client.ConnectAsync(dest, port, cts.Token);
@@ -731,15 +727,52 @@ namespace ChatApp
                     return;
                 }
 
-                SetStatus($"Encrypting & sending {fileInfo.Name} ({FormatFileSize(fileBytes.Length)})...");
+                // 4. Send file_meta packet
+                var metaPacket = new ChatPacket
+                {
+                    Type = "file_meta",
+                    Sender = txtNickname.Text.Trim(),
+                    FileName = fileInfo.Name,
+                    FileSize = fileInfo.Length,
+                    TotalChunks = totalChunks
+                };
 
-                // 4. Encrypt with AES-256-GCM
-                byte[] packedPayload = CryptoHelper.EncryptAesGcm(jsonPayload, sharedKey);
-                string payloadBase64 = Convert.ToBase64String(packedPayload);
+                string metaJson = JsonSerializer.Serialize(metaPacket);
+                byte[] packedMeta = CryptoHelper.EncryptAesGcm(metaJson, sharedKey);
+                await writer.WriteLineAsync(Convert.ToBase64String(packedMeta).AsMemory(), cts.Token);
 
-                await writer.WriteLineAsync(payloadBase64.AsMemory(), cts.Token);
+                // 5. Stream chunks with constant low memory usage
+                await using (var fs = new FileStream(ofd.FileName, FileMode.Open, FileAccess.Read, FileShare.Read, chunkSize, useAsync: true))
+                {
+                    byte[] buffer = new byte[chunkSize];
+                    long bytesSent = 0;
 
-                AppendSentFileLog(dest, fileInfo.Name, fileBytes.Length);
+                    for (int chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++)
+                    {
+                        int bytesRead = await fs.ReadAsync(buffer.AsMemory(0, chunkSize), cts.Token);
+                        if (bytesRead == 0) break;
+
+                        byte[] chunkBytes = bytesRead == chunkSize ? buffer : buffer[..bytesRead];
+
+                        var chunkPacket = new ChatPacket
+                        {
+                            Type = "file_chunk",
+                            ChunkIndex = chunkIndex,
+                            TotalChunks = totalChunks,
+                            FileData = Convert.ToBase64String(chunkBytes)
+                        };
+
+                        string chunkJson = JsonSerializer.Serialize(chunkPacket);
+                        byte[] packedChunk = CryptoHelper.EncryptAesGcm(chunkJson, sharedKey);
+                        await writer.WriteLineAsync(Convert.ToBase64String(packedChunk).AsMemory(), cts.Token);
+
+                        bytesSent += bytesRead;
+                        int progress = (int)((bytesSent * 100) / fileInfo.Length);
+                        SetStatus($"Sending {fileInfo.Name}: {progress}% ({FormatFileSize(bytesSent)} / {FormatFileSize(fileInfo.Length)})...");
+                    }
+                }
+
+                AppendSentFileLog(dest, fileInfo.Name, fileInfo.Length);
                 AddRecentDestination(dest);
                 SetStatus($"Ready | File {fileInfo.Name} sent successfully");
             }
@@ -777,7 +810,7 @@ namespace ChatApp
             {
                 try
                 {
-                    using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(60));
+                    using var timeoutCts = new CancellationTokenSource(TimeSpan.FromMinutes(30));
                     using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(serverToken, timeoutCts.Token);
                     CancellationToken token = linkedCts.Token;
 
@@ -793,7 +826,7 @@ namespace ChatApp
                     byte[]? sharedKey = CryptoHelper.TryDeriveSharedSecret(bobEcdh, senderPublicKey);
                     if (sharedKey == null) return;
 
-                    // 4. Receive and decrypt AES-256-GCM payload
+                    // 4. Receive and decrypt first payload
                     string? payloadBase64 = await reader.ReadLineAsync(token);
                     if (string.IsNullOrEmpty(payloadBase64)) return;
 
@@ -805,37 +838,46 @@ namespace ChatApp
                     // Handle structured ChatPacket or fallback
                     if (decryptedJson.StartsWith("{") && decryptedJson.EndsWith("}"))
                     {
+                        ChatPacket? packet = null;
                         try
                         {
-                            var packet = JsonSerializer.Deserialize<ChatPacket>(decryptedJson);
-                            if (packet != null)
-                            {
-                                if (packet.Type == "file")
-                                {
-                                    AppendReceivedFileLog(clientAddr, packet.Sender, packet.FileName ?? "unnamed_file", packet.FileSize);
-                                    NotifyNewMessage();
-
-                                    if (!string.IsNullOrEmpty(packet.FileData))
-                                    {
-                                        byte[] fileBytes = Convert.FromBase64String(packet.FileData);
-                                        BeginInvoke(new Action(async () =>
-                                        {
-                                            await PromptSaveFileAsync(packet.Sender, packet.FileName ?? "downloaded_file", fileBytes);
-                                        }));
-                                    }
-                                    return;
-                                }
-                                else if (packet.Type == "chat")
-                                {
-                                    AppendReceivedLog(clientAddr, $"{packet.Sender}: {packet.Content}");
-                                    NotifyNewMessage();
-                                    return;
-                                }
-                            }
+                            packet = JsonSerializer.Deserialize<ChatPacket>(decryptedJson);
                         }
                         catch
                         {
-                            // Fallback to plain string if JSON deserialization fails
+                            // Fallback
+                        }
+
+                        if (packet != null)
+                        {
+                            if (packet.Type == "file_meta")
+                            {
+                                // Chunked file transfer (supports up to 1 GB)
+                                await HandleChunkedFileReceiveAsync(reader, sharedKey, packet, clientAddr, token);
+                                return;
+                            }
+                            else if (packet.Type == "file")
+                            {
+                                // Single-packet file (legacy or small files)
+                                AppendReceivedFileLog(clientAddr, packet.Sender, packet.FileName ?? "unnamed_file", packet.FileSize);
+                                NotifyNewMessage();
+
+                                if (!string.IsNullOrEmpty(packet.FileData))
+                                {
+                                    byte[] fileBytes = Convert.FromBase64String(packet.FileData);
+                                    BeginInvoke(new Action(async () =>
+                                    {
+                                        await PromptSaveFileAsync(packet.Sender, packet.FileName ?? "downloaded_file", fileBytes);
+                                    }));
+                                }
+                                return;
+                            }
+                            else if (packet.Type == "chat")
+                            {
+                                AppendReceivedLog(clientAddr, $"{packet.Sender}: {packet.Content}");
+                                NotifyNewMessage();
+                                return;
+                            }
                         }
                     }
 
@@ -856,6 +898,128 @@ namespace ChatApp
                     Console.WriteLine($"[Client Handler Error] {ex.Message}");
                 }
             }
+        }
+
+        private async Task HandleChunkedFileReceiveAsync(StreamReader reader, byte[] sharedKey, ChatPacket metaPacket, string clientAddr, CancellationToken token)
+        {
+            string fileName = metaPacket.FileName ?? "downloaded_file";
+            string sender = metaPacket.Sender;
+            long totalSize = metaPacket.FileSize;
+            int totalChunks = metaPacket.TotalChunks;
+
+            string tempFilePath = Path.Combine(Path.GetTempPath(), $"ChatSharp_{Guid.NewGuid():N}.tmp");
+
+            try
+            {
+                SetStatus($"Receiving {fileName} ({FormatFileSize(totalSize)}) from {sender}...");
+
+                await using (var fs = new FileStream(tempFilePath, FileMode.Create, FileAccess.Write, FileShare.None, 1024 * 1024, useAsync: true))
+                {
+                    long totalBytesReceived = 0;
+
+                    for (int i = 0; i < totalChunks; i++)
+                    {
+                        string? chunkLine = await reader.ReadLineAsync(token);
+                        if (string.IsNullOrEmpty(chunkLine))
+                        {
+                            throw new IOException("Connection closed prematurely during file transfer.");
+                        }
+
+                        byte[] packedChunk = Convert.FromBase64String(chunkLine);
+                        string chunkJson = CryptoHelper.DecryptAesGcm(packedChunk, sharedKey);
+                        var chunkPacket = JsonSerializer.Deserialize<ChatPacket>(chunkJson);
+
+                        if (chunkPacket?.FileData == null)
+                        {
+                            throw new InvalidDataException("Invalid chunk payload.");
+                        }
+
+                        byte[] chunkBytes = Convert.FromBase64String(chunkPacket.FileData);
+                        await fs.WriteAsync(chunkBytes.AsMemory(), token);
+
+                        totalBytesReceived += chunkBytes.Length;
+                        int progress = totalSize > 0 ? (int)((totalBytesReceived * 100) / totalSize) : 100;
+                        SetStatus($"Receiving {fileName}: {progress}% ({FormatFileSize(totalBytesReceived)} / {FormatFileSize(totalSize)})...");
+                    }
+                }
+
+                AppendReceivedFileLog(clientAddr, sender, fileName, totalSize);
+                NotifyNewMessage();
+                SetStatus($"Received {fileName} ({FormatFileSize(totalSize)})");
+
+                // Prompt user on UI thread to save the received file
+                BeginInvoke(new Action(async () =>
+                {
+                    await PromptSaveReceivedTempFileAsync(sender, fileName, tempFilePath, totalSize);
+                }));
+            }
+            catch (Exception ex)
+            {
+                try { if (File.Exists(tempFilePath)) File.Delete(tempFilePath); } catch { }
+                AppendErrorLog($"Error receiving file '{fileName}': {ex.Message}");
+                SetStatus("File receive failed");
+            }
+        }
+
+        private async Task PromptSaveReceivedTempFileAsync(string sender, string fileName, string tempFilePath, long fileSize)
+        {
+            string formattedSize = FormatFileSize(fileSize);
+            DialogResult result = MessageBox.Show(
+                this,
+                $"Received file '{fileName}' ({formattedSize}) from {sender}.\r\n\r\nWould you like to save it to your computer?",
+                "Incoming File Transfer (Verified AES-256-GCM)",
+                MessageBoxButtons.YesNo,
+                MessageBoxIcon.Question);
+
+            if (result == DialogResult.Yes)
+            {
+                using var sfd = new SaveFileDialog
+                {
+                    Title = "Save Received File",
+                    FileName = fileName,
+                    Filter = "All Files (*.*)|*.*"
+                };
+
+                if (sfd.ShowDialog(this) == DialogResult.OK)
+                {
+                    try
+                    {
+                        if (File.Exists(sfd.FileName)) File.Delete(sfd.FileName);
+                        File.Move(tempFilePath, sfd.FileName);
+                        AppendSystemLog($"Saved '{fileName}' to {sfd.FileName}");
+                        SetStatus($"File saved: {Path.GetFileName(sfd.FileName)}");
+                        return;
+                    }
+                    catch (Exception)
+                    {
+                        // Fallback to streaming copy if cross-volume move is required
+                        try
+                        {
+                            await using (var src = new FileStream(tempFilePath, FileMode.Open, FileAccess.Read, FileShare.Read, 1024 * 1024, useAsync: true))
+                            await using (var dst = new FileStream(sfd.FileName, FileMode.Create, FileAccess.Write, FileShare.None, 1024 * 1024, useAsync: true))
+                            {
+                                await src.CopyToAsync(dst);
+                            }
+                            AppendSystemLog($"Saved '{fileName}' to {sfd.FileName}");
+                            SetStatus($"File saved: {Path.GetFileName(sfd.FileName)}");
+                        }
+                        catch (Exception ex)
+                        {
+                            AppendErrorLog($"Failed to save file: {ex.Message}");
+                        }
+                    }
+                }
+                else
+                {
+                    AppendSystemLog($"Save canceled for '{fileName}'.");
+                }
+            }
+            else
+            {
+                AppendSystemLog($"Declined file '{fileName}' from {sender}.");
+            }
+
+            try { if (File.Exists(tempFilePath)) File.Delete(tempFilePath); } catch { }
         }
 
         private async Task PromptSaveFileAsync(string sender, string fileName, byte[] fileBytes)
@@ -954,6 +1118,8 @@ namespace ChatApp
             public string? FileName { get; set; }
             public long FileSize { get; set; }
             public string? FileData { get; set; }
+            public int ChunkIndex { get; set; }
+            public int TotalChunks { get; set; }
         }
 
         public static class CryptoHelper

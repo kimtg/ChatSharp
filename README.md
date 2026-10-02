@@ -10,7 +10,7 @@
   - **Key Exchange**: Ephemeral **ECDH** over the standard **NIST P-256** curve (`nistP256`) with SHA-256 key derivation (KDF). Neither private keys nor shared secrets are ever transmitted across the network, providing **Perfect Forward Secrecy (PFS)**.
   - **Authenticated Cipher**: **AES-256-GCM** (Galois/Counter Mode) with 12-byte random nonces per transmission and 16-byte authentication tags. Protects against eavesdropping and guarantees tamper-proof message integrity.
 - **📎 Encrypted File Transfer**:
-  - Transfer files of any type (images, documents, archives, binaries) up to 50 MB securely.
+  - Transfer files of any type (images, documents, archives, binaries) up to 1 GB securely via streaming AES-256-GCM chunks.
   - Recipient is prompted with a confirmation dialog showing the sender's nickname, filename, and formatted size before saving.
 - **⚡ Fully Asynchronous & Non-Blocking**:
   - Built with modern `async`/`await` Task-based asynchronous networking (`TcpClient`, `TcpListener`).
@@ -117,7 +117,7 @@ bin\Release\net10.0-windows\ChatSharp.exe
 ### Sending a File
 1. Enter the destination IP and port.
 2. Click **📎 Send File...** next to the destination port field.
-3. Select any file (up to 50 MB).
+3. Select any file (up to 1 GB).
 4. The receiver will see an incoming transfer alert and be prompted to save the verified file to their preferred location.
 
 ### Exporting Chat History
