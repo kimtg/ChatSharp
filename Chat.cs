@@ -16,6 +16,10 @@ namespace ChatApp
 {
     public class ChatForm : Form
     {
+        private const byte PACKET_TYPE_CHAT = 1;
+        private const byte PACKET_TYPE_FILE = 2;
+        private const int CHUNK_SIZE = 1024 * 1024; // 1 MB binary chunks
+
         private RichTextBox rtbLog = null!;
         private TextBox txtMsg = null!;
         private Button btnSend = null!;
@@ -67,7 +71,7 @@ namespace ChatApp
         {
             InitializeComponent();
 
-            AppendSystemLog("Welcome to ChatSharp! End-to-end encrypted with ECDH & AES-256-GCM.");
+            AppendSystemLog("Welcome to ChatSharp! End-to-end encrypted with ECDH & AES-256-GCM (high-speed binary framing).");
             ShowMyAddr();
             txtMsg.Focus();
 
@@ -500,7 +504,7 @@ namespace ChatApp
                 _tcpListener = new TcpListener(IPAddress.Any, port);
                 _tcpListener.Start();
                 SetStatus($"Listening on port {port}");
-                AppendSystemLog($"Listening for connections on port {port} (ECDH + AES-256-GCM)...");
+                AppendSystemLog($"Listening for connections on port {port} (ECDH + AES-256-GCM binary protocol)...");
             }
             catch (Exception ex)
             {
@@ -573,37 +577,21 @@ namespace ChatApp
             try
             {
                 using var client = new TcpClient();
-                using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+                using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
 
                 await client.ConnectAsync(dest, port, cts.Token);
                 SetStatus($"Exchanging ECDH keys with {dest}:{port}...");
 
-                using var aliceEcdh = CryptoHelper.CreateEcdh();
                 using NetworkStream stream = client.GetStream();
-                using StreamReader reader = new StreamReader(stream, Encoding.UTF8);
-                using StreamWriter writer = new StreamWriter(stream, Encoding.UTF8) { AutoFlush = true };
+                using var aliceEcdh = CryptoHelper.CreateEcdh();
 
-                // 1. Send Alice's ECDH public key
-                string alicePublicKey = CryptoHelper.ExportPublicKey(aliceEcdh);
-                await writer.WriteLineAsync(alicePublicKey.AsMemory(), cts.Token);
+                // 1. Exchange ECDH Public Keys in binary
+                byte[] sharedKey = await PerformClientKeyExchangeAsync(stream, aliceEcdh, cts.Token);
 
-                // 2. Receive Bob's ECDH public key
-                string? bobPublicKey = await reader.ReadLineAsync(cts.Token);
-                if (string.IsNullOrEmpty(bobPublicKey))
-                {
-                    AppendErrorLog($"{dest}: Peer did not return an ECDH public key.");
-                    return;
-                }
+                // 2. Send Chat Packet Type
+                stream.WriteByte(PACKET_TYPE_CHAT);
 
-                // 3. Derive 256-bit shared key via ECDH
-                byte[]? sharedKey = CryptoHelper.TryDeriveSharedSecret(aliceEcdh, bobPublicKey);
-                if (sharedKey == null)
-                {
-                    AppendErrorLog($"{dest}: Failed to derive ECDH shared secret.");
-                    return;
-                }
-
-                // 4. Encrypt ChatPacket with AES-256-GCM
+                // 3. Encrypt & Send Chat Message
                 string senderNick = txtNickname.Text.Trim();
                 var packet = new ChatPacket
                 {
@@ -612,11 +600,8 @@ namespace ChatApp
                     Content = textToSend
                 };
 
-                string jsonPayload = JsonSerializer.Serialize(packet);
-                byte[] packedPayload = CryptoHelper.EncryptAesGcm(jsonPayload, sharedKey);
-                string payloadBase64 = Convert.ToBase64String(packedPayload);
-
-                await writer.WriteLineAsync(payloadBase64.AsMemory(), cts.Token);
+                byte[] jsonBytes = JsonSerializer.SerializeToUtf8Bytes(packet);
+                await WriteEncryptedPacketAsync(stream, jsonBytes, sharedKey, cts.Token);
 
                 AppendSentLog(dest, senderNick, textToSend);
                 AddRecentDestination(dest);
@@ -692,8 +677,7 @@ namespace ChatApp
 
             try
             {
-                const int chunkSize = 1024 * 1024; // 1 MB streaming chunks for low memory overhead
-                int totalChunks = (int)Math.Ceiling((double)fileInfo.Length / chunkSize);
+                int totalChunks = (int)Math.Ceiling((double)fileInfo.Length / CHUNK_SIZE);
 
                 using var client = new TcpClient();
                 using var cts = new CancellationTokenSource(TimeSpan.FromMinutes(30));
@@ -702,32 +686,16 @@ namespace ChatApp
                 await client.ConnectAsync(dest, port, cts.Token);
 
                 SetStatus($"Exchanging ECDH keys with {dest}:{port}...");
-                using var aliceEcdh = CryptoHelper.CreateEcdh();
                 using NetworkStream stream = client.GetStream();
-                using StreamReader reader = new StreamReader(stream, Encoding.UTF8);
-                using StreamWriter writer = new StreamWriter(stream, Encoding.UTF8) { AutoFlush = true };
+                using var aliceEcdh = CryptoHelper.CreateEcdh();
 
-                // 1. Send Alice's ECDH public key
-                string alicePublicKey = CryptoHelper.ExportPublicKey(aliceEcdh);
-                await writer.WriteLineAsync(alicePublicKey.AsMemory(), cts.Token);
+                // 1. Exchange ECDH Public Keys in binary
+                byte[] sharedKey = await PerformClientKeyExchangeAsync(stream, aliceEcdh, cts.Token);
 
-                // 2. Receive Bob's ECDH public key
-                string? bobPublicKey = await reader.ReadLineAsync(cts.Token);
-                if (string.IsNullOrEmpty(bobPublicKey))
-                {
-                    AppendErrorLog($"{dest}: Peer did not return an ECDH public key.");
-                    return;
-                }
+                // 2. Send File Packet Type
+                stream.WriteByte(PACKET_TYPE_FILE);
 
-                // 3. Derive 256-bit shared key via ECDH
-                byte[]? sharedKey = CryptoHelper.TryDeriveSharedSecret(aliceEcdh, bobPublicKey);
-                if (sharedKey == null)
-                {
-                    AppendErrorLog($"{dest}: Failed to derive ECDH shared secret.");
-                    return;
-                }
-
-                // 4. Send file_meta packet
+                // 3. Send Encrypted Metadata
                 var metaPacket = new ChatPacket
                 {
                     Type = "file_meta",
@@ -737,34 +705,22 @@ namespace ChatApp
                     TotalChunks = totalChunks
                 };
 
-                string metaJson = JsonSerializer.Serialize(metaPacket);
-                byte[] packedMeta = CryptoHelper.EncryptAesGcm(metaJson, sharedKey);
-                await writer.WriteLineAsync(Convert.ToBase64String(packedMeta).AsMemory(), cts.Token);
+                byte[] metaBytes = JsonSerializer.SerializeToUtf8Bytes(metaPacket);
+                await WriteEncryptedPacketAsync(stream, metaBytes, sharedKey, cts.Token);
 
-                // 5. Stream chunks with constant low memory usage
-                await using (var fs = new FileStream(ofd.FileName, FileMode.Open, FileAccess.Read, FileShare.Read, chunkSize, useAsync: true))
+                // 4. Stream Raw Binary Chunks with High Performance (No Base64 overhead)
+                await using (var fs = new FileStream(ofd.FileName, FileMode.Open, FileAccess.Read, FileShare.Read, CHUNK_SIZE, useAsync: true))
                 {
-                    byte[] buffer = new byte[chunkSize];
+                    byte[] fileBuffer = new byte[CHUNK_SIZE];
                     long bytesSent = 0;
 
                     for (int chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++)
                     {
-                        int bytesRead = await fs.ReadAsync(buffer.AsMemory(0, chunkSize), cts.Token);
+                        int bytesRead = await fs.ReadAsync(fileBuffer.AsMemory(0, CHUNK_SIZE), cts.Token);
                         if (bytesRead == 0) break;
 
-                        byte[] chunkBytes = bytesRead == chunkSize ? buffer : buffer[..bytesRead];
-
-                        var chunkPacket = new ChatPacket
-                        {
-                            Type = "file_chunk",
-                            ChunkIndex = chunkIndex,
-                            TotalChunks = totalChunks,
-                            FileData = Convert.ToBase64String(chunkBytes)
-                        };
-
-                        string chunkJson = JsonSerializer.Serialize(chunkPacket);
-                        byte[] packedChunk = CryptoHelper.EncryptAesGcm(chunkJson, sharedKey);
-                        await writer.WriteLineAsync(Convert.ToBase64String(packedChunk).AsMemory(), cts.Token);
+                        ReadOnlyMemory<byte> chunkSlice = fileBuffer.AsMemory(0, bytesRead);
+                        await WriteEncryptedPacketAsync(stream, chunkSlice, sharedKey, cts.Token);
 
                         bytesSent += bytesRead;
                         int progress = (int)((bytesSent * 100) / fileInfo.Length);
@@ -803,10 +759,8 @@ namespace ChatApp
         private async Task HandleIncomingClientAsync(TcpClient clientSocket, CancellationToken serverToken)
         {
             using (clientSocket)
-            using (var bobEcdh = CryptoHelper.CreateEcdh())
             using (NetworkStream stream = clientSocket.GetStream())
-            using (StreamReader reader = new StreamReader(stream, Encoding.UTF8))
-            using (StreamWriter writer = new StreamWriter(stream, Encoding.UTF8) { AutoFlush = true })
+            using (var bobEcdh = CryptoHelper.CreateEcdh())
             {
                 try
                 {
@@ -814,76 +768,35 @@ namespace ChatApp
                     using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(serverToken, timeoutCts.Token);
                     CancellationToken token = linkedCts.Token;
 
-                    // 1. Receive sender's ECDH public key
-                    string? senderPublicKey = await reader.ReadLineAsync(token);
-                    if (string.IsNullOrEmpty(senderPublicKey)) return;
+                    // 1. Binary ECDH Key Exchange
+                    byte[] sharedKey = await PerformServerKeyExchangeAsync(stream, bobEcdh, token);
 
-                    // 2. Send receiver's ECDH public key back
-                    string receiverPublicKey = CryptoHelper.ExportPublicKey(bobEcdh);
-                    await writer.WriteLineAsync(receiverPublicKey.AsMemory(), token);
-
-                    // 3. Derive 256-bit shared key via ECDH
-                    byte[]? sharedKey = CryptoHelper.TryDeriveSharedSecret(bobEcdh, senderPublicKey);
-                    if (sharedKey == null) return;
-
-                    // 4. Receive and decrypt first payload
-                    string? payloadBase64 = await reader.ReadLineAsync(token);
-                    if (string.IsNullOrEmpty(payloadBase64)) return;
-
-                    byte[] packedPayload = Convert.FromBase64String(payloadBase64);
-                    string decryptedJson = CryptoHelper.DecryptAesGcm(packedPayload, sharedKey);
+                    // 2. Read Packet Type
+                    byte[] typeBuf = new byte[1];
+                    await stream.ReadExactlyAsync(typeBuf, token);
+                    byte packetType = typeBuf[0];
 
                     string clientAddr = (clientSocket.Client.RemoteEndPoint as IPEndPoint)?.ToString() ?? "unknown";
 
-                    // Handle structured ChatPacket or fallback
-                    if (decryptedJson.StartsWith("{") && decryptedJson.EndsWith("}"))
+                    if (packetType == PACKET_TYPE_CHAT)
                     {
-                        ChatPacket? packet = null;
-                        try
-                        {
-                            packet = JsonSerializer.Deserialize<ChatPacket>(decryptedJson);
-                        }
-                        catch
-                        {
-                            // Fallback
-                        }
-
+                        byte[] jsonBytes = await ReadEncryptedPacketAsync(stream, sharedKey, token);
+                        var packet = JsonSerializer.Deserialize<ChatPacket>(jsonBytes);
                         if (packet != null)
                         {
-                            if (packet.Type == "file_meta")
-                            {
-                                // Chunked file transfer (supports up to 1 GB)
-                                await HandleChunkedFileReceiveAsync(reader, sharedKey, packet, clientAddr, token);
-                                return;
-                            }
-                            else if (packet.Type == "file")
-                            {
-                                // Single-packet file (legacy or small files)
-                                AppendReceivedFileLog(clientAddr, packet.Sender, packet.FileName ?? "unnamed_file", packet.FileSize);
-                                NotifyNewMessage();
-
-                                if (!string.IsNullOrEmpty(packet.FileData))
-                                {
-                                    byte[] fileBytes = Convert.FromBase64String(packet.FileData);
-                                    BeginInvoke(new Action(async () =>
-                                    {
-                                        await PromptSaveFileAsync(packet.Sender, packet.FileName ?? "downloaded_file", fileBytes);
-                                    }));
-                                }
-                                return;
-                            }
-                            else if (packet.Type == "chat")
-                            {
-                                AppendReceivedLog(clientAddr, $"{packet.Sender}: {packet.Content}");
-                                NotifyNewMessage();
-                                return;
-                            }
+                            AppendReceivedLog(clientAddr, $"{packet.Sender}: {packet.Content}");
+                            NotifyNewMessage();
                         }
                     }
-
-                    // Fallback for legacy plain text messages
-                    AppendReceivedLog(clientAddr, decryptedJson);
-                    NotifyNewMessage();
+                    else if (packetType == PACKET_TYPE_FILE)
+                    {
+                        byte[] metaBytes = await ReadEncryptedPacketAsync(stream, sharedKey, token);
+                        var metaPacket = JsonSerializer.Deserialize<ChatPacket>(metaBytes);
+                        if (metaPacket != null)
+                        {
+                            await HandleBinaryFileReceiveAsync(stream, sharedKey, metaPacket, clientAddr, token);
+                        }
+                    }
                 }
                 catch (OperationCanceledException)
                 {
@@ -900,7 +813,7 @@ namespace ChatApp
             }
         }
 
-        private async Task HandleChunkedFileReceiveAsync(StreamReader reader, byte[] sharedKey, ChatPacket metaPacket, string clientAddr, CancellationToken token)
+        private async Task HandleBinaryFileReceiveAsync(Stream stream, byte[] sharedKey, ChatPacket metaPacket, string clientAddr, CancellationToken token)
         {
             string fileName = metaPacket.FileName ?? "downloaded_file";
             string sender = metaPacket.Sender;
@@ -913,29 +826,14 @@ namespace ChatApp
             {
                 SetStatus($"Receiving {fileName} ({FormatFileSize(totalSize)}) from {sender}...");
 
-                await using (var fs = new FileStream(tempFilePath, FileMode.Create, FileAccess.Write, FileShare.None, 1024 * 1024, useAsync: true))
+                await using (var fs = new FileStream(tempFilePath, FileMode.Create, FileAccess.Write, FileShare.None, CHUNK_SIZE, useAsync: true))
                 {
                     long totalBytesReceived = 0;
 
                     for (int i = 0; i < totalChunks; i++)
                     {
-                        string? chunkLine = await reader.ReadLineAsync(token);
-                        if (string.IsNullOrEmpty(chunkLine))
-                        {
-                            throw new IOException("Connection closed prematurely during file transfer.");
-                        }
-
-                        byte[] packedChunk = Convert.FromBase64String(chunkLine);
-                        string chunkJson = CryptoHelper.DecryptAesGcm(packedChunk, sharedKey);
-                        var chunkPacket = JsonSerializer.Deserialize<ChatPacket>(chunkJson);
-
-                        if (chunkPacket?.FileData == null)
-                        {
-                            throw new InvalidDataException("Invalid chunk payload.");
-                        }
-
-                        byte[] chunkBytes = Convert.FromBase64String(chunkPacket.FileData);
-                        await fs.WriteAsync(chunkBytes.AsMemory(), token);
+                        byte[] chunkBytes = await ReadEncryptedPacketAsync(stream, sharedKey, token);
+                        await fs.WriteAsync(chunkBytes, token);
 
                         totalBytesReceived += chunkBytes.Length;
                         int progress = totalSize > 0 ? (int)((totalBytesReceived * 100) / totalSize) : 100;
@@ -959,6 +857,72 @@ namespace ChatApp
                 AppendErrorLog($"Error receiving file '{fileName}': {ex.Message}");
                 SetStatus("File receive failed");
             }
+        }
+
+        private static async Task<byte[]> PerformClientKeyExchangeAsync(Stream stream, ECDiffieHellman clientEcdh, CancellationToken token)
+        {
+            // Send client's 2-byte length + public key bytes
+            byte[] clientPubKey = clientEcdh.ExportSubjectPublicKeyInfo();
+            byte[] clientLenBytes = BitConverter.GetBytes((ushort)clientPubKey.Length);
+            await stream.WriteAsync(clientLenBytes, token);
+            await stream.WriteAsync(clientPubKey, token);
+
+            // Read server's 2-byte length + public key bytes
+            byte[] serverLenBuf = new byte[2];
+            await stream.ReadExactlyAsync(serverLenBuf, token);
+            ushort serverKeyLen = BitConverter.ToUInt16(serverLenBuf, 0);
+
+            byte[] serverPubKey = new byte[serverKeyLen];
+            await stream.ReadExactlyAsync(serverPubKey, token);
+
+            using var serverEcdh = ECDiffieHellman.Create();
+            serverEcdh.ImportSubjectPublicKeyInfo(serverPubKey, out _);
+            return clientEcdh.DeriveKeyFromHash(serverEcdh.PublicKey, HashAlgorithmName.SHA256);
+        }
+
+        private static async Task<byte[]> PerformServerKeyExchangeAsync(Stream stream, ECDiffieHellman serverEcdh, CancellationToken token)
+        {
+            // Read client's 2-byte length + public key bytes
+            byte[] clientLenBuf = new byte[2];
+            await stream.ReadExactlyAsync(clientLenBuf, token);
+            ushort clientKeyLen = BitConverter.ToUInt16(clientLenBuf, 0);
+
+            byte[] clientPubKey = new byte[clientKeyLen];
+            await stream.ReadExactlyAsync(clientPubKey, token);
+
+            // Send server's 2-byte length + public key bytes
+            byte[] serverPubKey = serverEcdh.ExportSubjectPublicKeyInfo();
+            byte[] serverLenBytes = BitConverter.GetBytes((ushort)serverPubKey.Length);
+            await stream.WriteAsync(serverLenBytes, token);
+            await stream.WriteAsync(serverPubKey, token);
+
+            using var clientEcdh = ECDiffieHellman.Create();
+            clientEcdh.ImportSubjectPublicKeyInfo(clientPubKey, out _);
+            return serverEcdh.DeriveKeyFromHash(clientEcdh.PublicKey, HashAlgorithmName.SHA256);
+        }
+
+        private static async Task WriteEncryptedPacketAsync(Stream stream, ReadOnlyMemory<byte> plaintext, byte[] key, CancellationToken token)
+        {
+            byte[] encrypted = CryptoHelper.EncryptAesGcm(plaintext.Span, key);
+            byte[] lenBytes = BitConverter.GetBytes(encrypted.Length);
+            await stream.WriteAsync(lenBytes, token);
+            await stream.WriteAsync(encrypted, token);
+        }
+
+        private static async Task<byte[]> ReadEncryptedPacketAsync(Stream stream, byte[] key, CancellationToken token)
+        {
+            byte[] lenBuf = new byte[4];
+            await stream.ReadExactlyAsync(lenBuf, token);
+            int len = BitConverter.ToInt32(lenBuf, 0);
+
+            if (len < 28 || len > 100 * 1024 * 1024)
+            {
+                throw new InvalidDataException($"Invalid packet length received: {len} bytes.");
+            }
+
+            byte[] payloadBuf = new byte[len];
+            await stream.ReadExactlyAsync(payloadBuf, token);
+            return CryptoHelper.DecryptAesGcm(payloadBuf, key);
         }
 
         private async Task PromptSaveReceivedTempFileAsync(string sender, string fileName, string tempFilePath, long fileSize)
@@ -995,8 +959,8 @@ namespace ChatApp
                         // Fallback to streaming copy if cross-volume move is required
                         try
                         {
-                            await using (var src = new FileStream(tempFilePath, FileMode.Open, FileAccess.Read, FileShare.Read, 1024 * 1024, useAsync: true))
-                            await using (var dst = new FileStream(sfd.FileName, FileMode.Create, FileAccess.Write, FileShare.None, 1024 * 1024, useAsync: true))
+                            await using (var src = new FileStream(tempFilePath, FileMode.Open, FileAccess.Read, FileShare.Read, CHUNK_SIZE, useAsync: true))
+                            await using (var dst = new FileStream(sfd.FileName, FileMode.Create, FileAccess.Write, FileShare.None, CHUNK_SIZE, useAsync: true))
                             {
                                 await src.CopyToAsync(dst);
                             }
@@ -1020,49 +984,6 @@ namespace ChatApp
             }
 
             try { if (File.Exists(tempFilePath)) File.Delete(tempFilePath); } catch { }
-        }
-
-        private async Task PromptSaveFileAsync(string sender, string fileName, byte[] fileBytes)
-        {
-            string formattedSize = FormatFileSize(fileBytes.Length);
-            DialogResult result = MessageBox.Show(
-                this,
-                $"Received file '{fileName}' ({formattedSize}) from {sender}.\r\n\r\nWould you like to save it to your computer?",
-                "Incoming File Transfer (Verified AES-256-GCM)",
-                MessageBoxButtons.YesNo,
-                MessageBoxIcon.Question);
-
-            if (result == DialogResult.Yes)
-            {
-                using var sfd = new SaveFileDialog
-                {
-                    Title = "Save Received File",
-                    FileName = fileName,
-                    Filter = "All Files (*.*)|*.*"
-                };
-
-                if (sfd.ShowDialog(this) == DialogResult.OK)
-                {
-                    try
-                    {
-                        await File.WriteAllBytesAsync(sfd.FileName, fileBytes);
-                        AppendSystemLog($"Saved '{fileName}' to {sfd.FileName}");
-                        SetStatus($"File saved: {Path.GetFileName(sfd.FileName)}");
-                    }
-                    catch (Exception ex)
-                    {
-                        AppendErrorLog($"Failed to save file: {ex.Message}");
-                    }
-                }
-                else
-                {
-                    AppendSystemLog($"Save canceled for '{fileName}'.");
-                }
-            }
-            else
-            {
-                AppendSystemLog($"Declined file '{fileName}' from {sender}.");
-            }
         }
 
         private void NotifyNewMessage()
@@ -1117,8 +1038,6 @@ namespace ChatApp
             public string? Content { get; set; }
             public string? FileName { get; set; }
             public long FileSize { get; set; }
-            public string? FileData { get; set; }
-            public int ChunkIndex { get; set; }
             public int TotalChunks { get; set; }
         }
 
@@ -1129,38 +1048,16 @@ namespace ChatApp
                 return ECDiffieHellman.Create(ECCurve.NamedCurves.nistP256);
             }
 
-            public static string ExportPublicKey(ECDiffieHellman ecdh)
+            public static byte[] EncryptAesGcm(ReadOnlySpan<byte> plaintext, byte[] key256)
             {
-                return Convert.ToBase64String(ecdh.ExportSubjectPublicKeyInfo());
-            }
-
-            public static byte[]? TryDeriveSharedSecret(ECDiffieHellman ecdh, string peerPublicKeyBase64)
-            {
-                try
-                {
-                    byte[] peerKeyBytes = Convert.FromBase64String(peerPublicKeyBase64);
-                    using var peerEcdh = ECDiffieHellman.Create();
-                    peerEcdh.ImportSubjectPublicKeyInfo(peerKeyBytes, out _);
-                    return ecdh.DeriveKeyFromHash(peerEcdh.PublicKey, HashAlgorithmName.SHA256);
-                }
-                catch (Exception ex)
-                {
-                    Console.WriteLine($"[Crypto] Key derivation failed: {ex.Message}");
-                    return null;
-                }
-            }
-
-            public static byte[] EncryptAesGcm(string plaintext, byte[] key256)
-            {
-                byte[] plaintextBytes = Encoding.UTF8.GetBytes(plaintext);
                 byte[] nonce = new byte[AesGcm.NonceByteSizes.MaxSize]; // 12 bytes
                 RandomNumberGenerator.Fill(nonce);
 
                 byte[] tag = new byte[AesGcm.TagByteSizes.MaxSize]; // 16 bytes
-                byte[] ciphertext = new byte[plaintextBytes.Length];
+                byte[] ciphertext = new byte[plaintext.Length];
 
                 using var aes = new AesGcm(key256, AesGcm.TagByteSizes.MaxSize);
-                aes.Encrypt(nonce, plaintextBytes, ciphertext, tag);
+                aes.Encrypt(nonce, plaintext, ciphertext, tag);
 
                 // Format: Nonce (12) + Tag (16) + Ciphertext
                 byte[] packed = new byte[nonce.Length + tag.Length + ciphertext.Length];
@@ -1171,7 +1068,7 @@ namespace ChatApp
                 return packed;
             }
 
-            public static string DecryptAesGcm(byte[] packedPayload, byte[] key256)
+            public static byte[] DecryptAesGcm(ReadOnlySpan<byte> packedPayload, byte[] key256)
             {
                 const int nonceSize = 12;
                 const int tagSize = 16;
@@ -1180,15 +1077,15 @@ namespace ChatApp
                     throw new CryptographicException("Ciphertext payload is too short.");
                 }
 
-                byte[] nonce = packedPayload[..nonceSize];
-                byte[] tag = packedPayload[nonceSize..(nonceSize + tagSize)];
-                byte[] ciphertext = packedPayload[(nonceSize + tagSize)..];
+                ReadOnlySpan<byte> nonce = packedPayload.Slice(0, nonceSize);
+                ReadOnlySpan<byte> tag = packedPayload.Slice(nonceSize, tagSize);
+                ReadOnlySpan<byte> ciphertext = packedPayload.Slice(nonceSize + tagSize);
 
                 byte[] plaintextBytes = new byte[ciphertext.Length];
                 using var aes = new AesGcm(key256, tagSize);
                 aes.Decrypt(nonce, ciphertext, tag, plaintextBytes);
 
-                return Encoding.UTF8.GetString(plaintextBytes);
+                return plaintextBytes;
             }
         }
 

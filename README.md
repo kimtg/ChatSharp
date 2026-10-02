@@ -9,8 +9,9 @@
 - **🛡️ End-to-End Authenticated Encryption**:
   - **Key Exchange**: Ephemeral **ECDH** over the standard **NIST P-256** curve (`nistP256`) with SHA-256 key derivation (KDF). Neither private keys nor shared secrets are ever transmitted across the network, providing **Perfect Forward Secrecy (PFS)**.
   - **Authenticated Cipher**: **AES-256-GCM** (Galois/Counter Mode) with 12-byte random nonces per transmission and 16-byte authentication tags. Protects against eavesdropping and guarantees tamper-proof message integrity.
-- **📎 Encrypted File Transfer**:
-  - Transfer files of any type (images, documents, archives, binaries) up to 1 GB securely via streaming AES-256-GCM chunks.
+- **📎 High-Speed Binary File Transfer**:
+  - Transfer files of any type (images, documents, archives, binaries) up to 1 GB at wire speed.
+  - **Zero Base64 Overhead**: Directly streams raw binary AES-256-GCM chunks (`[4-byte Length] + [Nonce (12)] + [Tag (16)] + [Ciphertext]`), completely eliminating the 33%-78% Base64 bandwidth bloat and string allocations.
   - Recipient is prompted with a confirmation dialog showing the sender's nickname, filename, and formatted size before saving.
 - **⚡ Fully Asynchronous & Non-Blocking**:
   - Built with modern `async`/`await` Task-based asynchronous networking (`TcpClient`, `TcpListener`).
@@ -43,16 +44,17 @@
    ==============                                    ==============
 [Generate Ephemeral ECDH]                         [Listening on Port]
           |                                                |
-          |-------- 1. Alice's Public Key (Base64) ------->|
+          |------- 1. Alice Public Key (Binary: 2B+N) ---->|
           |                                       [Generate Ephemeral ECDH]
-          |<------- 2. Bob's Public Key (Base64) ----------|
+          |<------ 2. Bob Public Key (Binary: 2B+N) -------|
           |                                                |
 [Derive 256-bit Key via SHA256]                   [Derive 256-bit Key via SHA256]
           |                                                |
-[Encrypt Packet (AES-256-GCM)]                             |
-   (Nonce + Tag + Ciphertext)                              |
+[Binary Packet: Type + Encrypted Payload]                  |
+  ([Type(1B)] + [Len(4B)] + [Nonce(12B)] + [Tag(16B)] + [Ciphertext])
           |                                                |
-          |-------- 3. Encrypted Payload (Base64) -------->|
+          |-------- 3. Binary AES-GCM Chunks ------------->|
+          |            (Direct wire speed, zero Base64)    |
           |                                                |
           |                                       [Decrypt & Verify Tag]
           |                                                |
