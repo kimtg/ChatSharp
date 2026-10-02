@@ -673,7 +673,7 @@ namespace ChatApp
             btnSend.Enabled = false;
             btnSendFile.Enabled = false;
             txtMsg.Enabled = false;
-            SetStatus($"Preparing {fileInfo.Name} ({FormatFileSize(fileInfo.Length)})...");
+            SetStatus($"Connecting to {dest}:{port}...");
 
             try
             {
@@ -682,10 +682,9 @@ namespace ChatApp
                 using var client = new TcpClient();
                 using var cts = new CancellationTokenSource(TimeSpan.FromMinutes(30));
 
-                SetStatus($"Connecting to {dest}:{port}...");
                 await client.ConnectAsync(dest, port, cts.Token);
-
                 SetStatus($"Exchanging ECDH keys with {dest}:{port}...");
+
                 using NetworkStream stream = client.GetStream();
                 using var aliceEcdh = CryptoHelper.CreateEcdh();
 
@@ -695,20 +694,35 @@ namespace ChatApp
                 // 2. Send File Packet Type
                 stream.WriteByte(PACKET_TYPE_FILE);
 
-                // 3. Send Encrypted Metadata
-                var metaPacket = new ChatPacket
+                // 3. Send File Offer Metadata (file name & size first)
+                var offerPacket = new ChatPacket
                 {
-                    Type = "file_meta",
+                    Type = "file_offer",
                     Sender = txtNickname.Text.Trim(),
                     FileName = fileInfo.Name,
                     FileSize = fileInfo.Length,
                     TotalChunks = totalChunks
                 };
 
-                byte[] metaBytes = JsonSerializer.SerializeToUtf8Bytes(metaPacket);
+                byte[] metaBytes = JsonSerializer.SerializeToUtf8Bytes(offerPacket);
                 await WriteEncryptedPacketAsync(stream, metaBytes, sharedKey, cts.Token);
 
-                // 4. Stream Raw Binary Chunks with High Performance (No Base64 overhead)
+                SetStatus($"Waiting for {dest} to accept '{fileInfo.Name}' ({FormatFileSize(fileInfo.Length)})...");
+                AppendSystemLog($"Offered '{fileInfo.Name}' ({FormatFileSize(fileInfo.Length)}) to {dest}. Waiting for acceptance...");
+
+                // 4. Wait for Receiver's Acceptance Response (1 = Accept, 0 = Decline)
+                byte[] responseBytes = await ReadEncryptedPacketAsync(stream, sharedKey, cts.Token);
+                if (responseBytes.Length == 0 || responseBytes[0] != 1)
+                {
+                    AppendSystemLog($"{dest} declined the file transfer for '{fileInfo.Name}'.");
+                    SetStatus("File transfer declined by receiver");
+                    return;
+                }
+
+                AppendSystemLog($"{dest} accepted '{fileInfo.Name}'. Starting transfer...");
+                SetStatus($"Sending {fileInfo.Name}...");
+
+                // 5. Start streaming chunks only after receiver accepts
                 await using (var fs = new FileStream(ofd.FileName, FileMode.Open, FileAccess.Read, FileShare.Read, CHUNK_SIZE, useAsync: true))
                 {
                     byte[] fileBuffer = new byte[CHUNK_SIZE];
@@ -820,13 +834,62 @@ namespace ChatApp
             long totalSize = metaPacket.FileSize;
             int totalChunks = metaPacket.TotalChunks;
 
-            string tempFilePath = Path.Combine(Path.GetTempPath(), $"ChatSharp_{Guid.NewGuid():N}.tmp");
+            NotifyNewMessage();
+            SetStatus($"Incoming file request from {sender}: {fileName} ({FormatFileSize(totalSize)})");
+
+            // Prompt user on UI thread BEFORE file transfer begins
+            var tcs = new TaskCompletionSource<(bool Accepted, string? SavePath)>();
+
+            BeginInvoke(new Action(() =>
+            {
+                string formattedSize = FormatFileSize(totalSize);
+                DialogResult dr = MessageBox.Show(
+                    this,
+                    $"{sender} wants to send you:\r\n\r\n'{fileName}' ({formattedSize})\r\n\r\nDo you want to accept and download this file?",
+                    "Incoming File Transfer Request",
+                    MessageBoxButtons.YesNo,
+                    MessageBoxIcon.Question);
+
+                if (dr == DialogResult.Yes)
+                {
+                    using var sfd = new SaveFileDialog
+                    {
+                        Title = "Save Incoming File As...",
+                        FileName = fileName,
+                        Filter = "All Files (*.*)|*.*"
+                    };
+
+                    if (sfd.ShowDialog(this) == DialogResult.OK)
+                    {
+                        tcs.TrySetResult((true, sfd.FileName));
+                        return;
+                    }
+                }
+
+                tcs.TrySetResult((false, null));
+            }));
+
+            // Wait for user's decision (with cancellation support)
+            (bool accepted, string? savePath) = await tcs.Task.WaitAsync(token);
+
+            if (!accepted || string.IsNullOrEmpty(savePath))
+            {
+                // Send decline response byte (0)
+                await WriteEncryptedPacketAsync(stream, new byte[] { 0 }, sharedKey, token);
+                AppendSystemLog($"Declined file transfer for '{fileName}' from {sender}.");
+                SetStatus($"Declined file '{fileName}'");
+                return;
+            }
+
+            // Send accept response byte (1)
+            await WriteEncryptedPacketAsync(stream, new byte[] { 1 }, sharedKey, token);
+            AppendSystemLog($"Accepted '{fileName}' from {sender}. Downloading to {savePath}...");
+            SetStatus($"Receiving {fileName} ({FormatFileSize(totalSize)})...");
 
             try
             {
-                SetStatus($"Receiving {fileName} ({FormatFileSize(totalSize)}) from {sender}...");
-
-                await using (var fs = new FileStream(tempFilePath, FileMode.Create, FileAccess.Write, FileShare.None, CHUNK_SIZE, useAsync: true))
+                // Stream chunks directly into the user's chosen file path
+                await using (var fs = new FileStream(savePath, FileMode.Create, FileAccess.Write, FileShare.None, CHUNK_SIZE, useAsync: true))
                 {
                     long totalBytesReceived = 0;
 
@@ -842,18 +905,13 @@ namespace ChatApp
                 }
 
                 AppendReceivedFileLog(clientAddr, sender, fileName, totalSize);
+                AppendSystemLog($"File '{fileName}' saved successfully to {savePath}");
                 NotifyNewMessage();
                 SetStatus($"Received {fileName} ({FormatFileSize(totalSize)})");
-
-                // Prompt user on UI thread to save the received file
-                BeginInvoke(new Action(async () =>
-                {
-                    await PromptSaveReceivedTempFileAsync(sender, fileName, tempFilePath, totalSize);
-                }));
             }
             catch (Exception ex)
             {
-                try { if (File.Exists(tempFilePath)) File.Delete(tempFilePath); } catch { }
+                try { if (File.Exists(savePath)) File.Delete(savePath); } catch { }
                 AppendErrorLog($"Error receiving file '{fileName}': {ex.Message}");
                 SetStatus("File receive failed");
             }
@@ -923,67 +981,6 @@ namespace ChatApp
             byte[] payloadBuf = new byte[len];
             await stream.ReadExactlyAsync(payloadBuf, token);
             return CryptoHelper.DecryptAesGcm(payloadBuf, key);
-        }
-
-        private async Task PromptSaveReceivedTempFileAsync(string sender, string fileName, string tempFilePath, long fileSize)
-        {
-            string formattedSize = FormatFileSize(fileSize);
-            DialogResult result = MessageBox.Show(
-                this,
-                $"Received file '{fileName}' ({formattedSize}) from {sender}.\r\n\r\nWould you like to save it to your computer?",
-                "Incoming File Transfer (Verified AES-256-GCM)",
-                MessageBoxButtons.YesNo,
-                MessageBoxIcon.Question);
-
-            if (result == DialogResult.Yes)
-            {
-                using var sfd = new SaveFileDialog
-                {
-                    Title = "Save Received File",
-                    FileName = fileName,
-                    Filter = "All Files (*.*)|*.*"
-                };
-
-                if (sfd.ShowDialog(this) == DialogResult.OK)
-                {
-                    try
-                    {
-                        if (File.Exists(sfd.FileName)) File.Delete(sfd.FileName);
-                        File.Move(tempFilePath, sfd.FileName);
-                        AppendSystemLog($"Saved '{fileName}' to {sfd.FileName}");
-                        SetStatus($"File saved: {Path.GetFileName(sfd.FileName)}");
-                        return;
-                    }
-                    catch (Exception)
-                    {
-                        // Fallback to streaming copy if cross-volume move is required
-                        try
-                        {
-                            await using (var src = new FileStream(tempFilePath, FileMode.Open, FileAccess.Read, FileShare.Read, CHUNK_SIZE, useAsync: true))
-                            await using (var dst = new FileStream(sfd.FileName, FileMode.Create, FileAccess.Write, FileShare.None, CHUNK_SIZE, useAsync: true))
-                            {
-                                await src.CopyToAsync(dst);
-                            }
-                            AppendSystemLog($"Saved '{fileName}' to {sfd.FileName}");
-                            SetStatus($"File saved: {Path.GetFileName(sfd.FileName)}");
-                        }
-                        catch (Exception ex)
-                        {
-                            AppendErrorLog($"Failed to save file: {ex.Message}");
-                        }
-                    }
-                }
-                else
-                {
-                    AppendSystemLog($"Save canceled for '{fileName}'.");
-                }
-            }
-            else
-            {
-                AppendSystemLog($"Declined file '{fileName}' from {sender}.");
-            }
-
-            try { if (File.Exists(tempFilePath)) File.Delete(tempFilePath); } catch { }
         }
 
         private void NotifyNewMessage()

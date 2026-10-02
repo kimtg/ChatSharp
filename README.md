@@ -11,8 +11,8 @@
   - **Authenticated Cipher**: **AES-256-GCM** (Galois/Counter Mode) with 12-byte random nonces per transmission and 16-byte authentication tags. Protects against eavesdropping and guarantees tamper-proof message integrity.
 - **📎 High-Speed Binary File Transfer**:
   - Transfer files of any type (images, documents, archives, binaries) up to 1 GB at wire speed.
-  - **Zero Base64 Overhead**: Directly streams raw binary AES-256-GCM chunks (`[4-byte Length] + [Nonce (12)] + [Tag (16)] + [Ciphertext]`), completely eliminating the 33%-78% Base64 bandwidth bloat and string allocations.
-  - Recipient is prompted with a confirmation dialog showing the sender's nickname, filename, and formatted size before saving.
+  - **Zero Base64 Overhead**: Directly streams raw binary AES-256-GCM chunks (`[4-byte Length] + [Nonce (12)] + [Tag (16)] + [Ciphertext]`), completely eliminating Base64 bandwidth bloat and memory allocations.
+  - **Interactive Acceptance Handshake**: File metadata (name & size) is sent first. Transmission of file chunks begins only *after* the recipient accepts and selects a save location. If declined, zero data chunks are sent.
 - **⚡ Fully Asynchronous & Non-Blocking**:
   - Built with modern `async`/`await` Task-based asynchronous networking (`TcpClient`, `TcpListener`).
   - The UI remains completely responsive with zero freezing during connection handshakes, timeouts, or file transfers.
@@ -50,15 +50,19 @@
           |                                                |
 [Derive 256-bit Key via SHA256]                   [Derive 256-bit Key via SHA256]
           |                                                |
-[Binary Packet: Type + Encrypted Payload]                  |
-  ([Type(1B)] + [Len(4B)] + [Nonce(12B)] + [Tag(16B)] + [Ciphertext])
+   --- FILE TRANSFER HANDSHAKE ---                         |
           |                                                |
-          |-------- 3. Binary AES-GCM Chunks ------------->|
-          |            (Direct wire speed, zero Base64)    |
+          |------- 3. File Offer (Name, Size, Chunks) ---->|
+          |           (Encrypted Metadata)                 |
+          |                                       [Prompt User & Select Path]
+          |<------ 4. Acceptance Response (1=Yes, 0=No) ---|
           |                                                |
-          |                                       [Decrypt & Verify Tag]
+   [If Accepted: Start Stream]                             |
           |                                                |
-       [Close]                                       [Display / Save]
+          |------- 5. Binary AES-GCM Chunks -------------->|
+          |           (Written directly to chosen path)    |
+          |                                                |
+       [Close]                                       [Completed & Notify]
 ```
 
 1. **Key Agreement**: Alice and Bob generate ephemeral NIST P-256 keypairs and exchange only their SubjectPublicKeyInfo (X.509 format).
@@ -120,7 +124,8 @@ bin\Release\net10.0-windows\ChatSharp.exe
 1. Enter the destination IP and port.
 2. Click **📎 Send File...** next to the destination port field.
 3. Select any file (up to 1 GB).
-4. The receiver will see an incoming transfer alert and be prompted to save the verified file to their preferred location.
+4. The receiver receives the file name and size, and is prompted to accept or decline the transfer.
+5. If accepted, the receiver selects a save location and the binary chunks stream directly to that file. If declined, the transfer is canceled immediately without sending file chunks.
 
 ### Exporting Chat History
 - Click the **Save Log** button in the top bar (or right-click the log and choose **Save Chat History...**).
