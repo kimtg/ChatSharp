@@ -486,7 +486,7 @@ namespace ChatApp
             }
             catch (Exception ex)
             {
-                Console.WriteLine(ex.Message);
+                AppendErrorLog($"Failed to retrieve IP address: {ex.Message}");
             }
 
             AppendSystemLog($"Local IPv4 address: {myAddr ?? "127.0.0.1"}");
@@ -822,7 +822,7 @@ namespace ChatApp
                 }
                 catch (Exception ex)
                 {
-                    Console.WriteLine($"[Client Handler Error] {ex.Message}");
+                    AppendErrorLog($"Client connection error: {ex.Message}");
                 }
             }
         }
